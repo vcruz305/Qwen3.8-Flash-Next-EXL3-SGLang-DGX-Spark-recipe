@@ -13,9 +13,10 @@ cache, its scheduler, its speculative-decoding stack).
 
 ## Status
 
-Correctness-verified serving, with EAGLE/MTP speculative decoding working
-and measured. One known idle-crash bug is still open (see below) -- read it
-before relying on this for unattended production traffic.
+Measured on one DGX Spark GB10 (2026-09-16): EAGLE/MTP 3/1/4 + ReplaySSM +
+fused `exl3_moe` at **~35 tok/s** decode (`n=256`, ctx 4096). One known
+idle-crash bug is still open (see below) -- read it before relying on this
+for unattended production traffic.
 
 ## Hardware
 
@@ -41,30 +42,36 @@ tower.
 
 - One DGX Spark (GB10, aarch64), NVMe with room for the ~87 GB pack plus the
   ~95 GiB PLE table (file-offloaded, not fully resident).
-- A SGLang build with the `Qwen4ExpForConditionalGeneration` model class.
-  This recipe was developed against a working tree derived from SGLang
-  upstream with Qwen4-Exp support; confirm your checkout has
-  `python/sglang/srt/models/qwen4_exp.py` and
-  `python/sglang/srt/models/qwen4_exp_mtp.py`.
-- The [`sglang-exl3`](https://github.com/vcruz305/sglang-exl3) plugin,
-  `master` or newer. **MTP requires the native-EXL3-draft fix (merged
-  2026-09-10, PR #2)** -- without it the MTP draft loads dense random
-  weights and the accept rate is permanently 0. Confirm your checkout has
-  `SGLANG_EXL3_MTP_EXL3` referenced in `src/sglang_exl3/exl3.py`.
-- `exllamav3`, built from source with the GB10/aarch64 patch.
-- `torch`/CUDA 13.0 for aarch64.
+- A SGLang build with `Qwen4ExpForConditionalGeneration` and
+  `qwen4_exp_mtp.py`. The 2026-09-16 numbers used pin commit **`4ccff141d`**
+  (`lmsysorg/sglang:dev-qwen38-next-local` linux/arm64) + Torch **2.13.0+cu130**.
+  Overlay that pin with `scripts/apply_sglang_pin_overlays.sh` (see below).
+- The [`sglang-exl3`](https://github.com/vcruz305/sglang-exl3) plugin at
+  **PR #3** (`fix/gb10-torch214-sglang-cli`, includes `b1d9eab`) or later.
+  Need: `SGLANG_EXL3_MTP_EXL3`, mixed-K GDN/`lm_head` EXL3, **do not**
+  EXL3-quantize `embed_tokens`, and the 35-arg `exl3_moe` call. Launch with
+  `python -m sglang_exl3.launch_server` (bare `sglang.launch_server` never
+  registers EXL3).
+- `exllamav3` built against the same Torch (GB10: `TORCH_CUDA_ARCH_LIST=12.1a`).
+  Current `exl3_moe` is 35 args (`num_active`, scratch, tables, count_lo/hi,
+  `m_tile`). A 29-arg call TypeErrors and falls back to the python expert
+  loop (~10 tok/s).
+- Do **not** set `EXL3_FUSED_MOE=0` or `SGLANG_EXL3_ALL_LINEARS=1`.
+  Plugin `native` MoE expects 4096x2048; this pack is 2560x640 -- keep
+  `SGLANG_EXL3_MOE_KERNEL=exllamav3`.
 
 ## Quick start
 
 ### 1. Install the runtime
 
-Install SGLang (Qwen4-Exp-capable build), `exllamav3` from source, and the
-`sglang-exl3` plugin per Prerequisites, then confirm:
+Install SGLang (Qwen4-Exp pin), `exllamav3` from source against that Torch,
+and the `sglang-exl3` plugin per Prerequisites. Overlay the pin, then confirm:
 
 ```bash
+SGLANG_PIN=/path/to/sglang/python bash scripts/apply_sglang_pin_overlays.sh
 python -c "import sglang; print(sglang.__version__)"
 python -c "import sglang_exl3; print('sglang_exl3 OK')"
-python -c "import exllamav3_ext; print('exllamav3_ext OK')"
+python -c "import exllamav3_ext; print(exllamav3_ext.exl3_moe.__doc__.split(chr(10))[0])"
 ```
 
 ### 2. Download the pack
@@ -96,10 +103,11 @@ MODEL_DIR=~/models/Qwen3.8-Flash-Next-exl3-3.05bpw \
 ```
 
 Both bind `127.0.0.1:30000` by default (override `PORT`). Load takes about
-5-6 minutes for the target model plus another ~70-75s for the MTP draft.
-See each script's header for every override
-(`CTX_LEN`, `MEM_FRAC`, `MAX_REQS`, `PLE_OFFLOAD_DIR`, `SPEC_STEPS`,
-`SPEC_TOPK`, `SPEC_DRAFT_TOKENS`).
+5-6 minutes for the target plus ~30-50s for the MTP draft. The MTP script
+defaults to ReplaySSM on, `EXL3_FUSED_MOE=1`, `sglang_exl3.launch_server`.
+See each script header for overrides (`CTX_LEN`, `MEM_FRAC`, `MAX_REQS`,
+`PLE_OFFLOAD_DIR`, `SPEC_STEPS`, `SPEC_TOPK`, `SPEC_DRAFT_TOKENS`,
+`ENABLE_REPLAYSSM`).
 
 Optionally run `scripts/memory-guard.sh` alongside as a watchdog -- GB10 is
 unified memory, so there is no separate VRAM pool to protect against OOM;
@@ -109,20 +117,44 @@ see the script's own header for tuning `FLOOR_GIB`/`GUARD_GIB`.
 
 ```bash
 python scripts/bench_decode.py --base-url http://127.0.0.1:30000 \
-  --model Qwen3.8-Flash-Next
+  --model Qwen3.8-Flash-Next --max-tokens 256
 ```
 
-## Headline (measured 2026-09-10, one DGX Spark GB10)
+`n=256` is `max_tokens` (generated tokens), not context. Measured ctx is
+`--context-length 4096`. Wall tok/s includes TTFT; the scheduler
+`gen throughput` line is decode-only.
 
-| Config | Accept rate | Accept len | tok/s (128 tok) | Notes |
+## Headline (measured 2026-09-16, one DGX Spark GB10, ctx 4096)
+
+Prompt `The capital of France is`. CUDA graphs off (PLE file offload).
+Fused `exl3_moe` (35-arg ABI). EAGLE topk=1.
+
+| Config | Accept rate | Accept len | tok/s | Notes |
 |---|---|---|---|---|
-| No draft | n/a | n/a | ~17 | fused shared gate, cos 0.999978 vs GT |
-| MTP EAGLE, steps=3 topk=1 draft_tokens=4 (**before** native-EXL3 draft fix) | 0.00 | 1.00 | ~11 | draft loaded dense random weights -- slower than no-draft |
-| MTP EAGLE, steps=3 topk=1 draft_tokens=4 (**after** fix, native EXL3 draft) | **0.47-0.72** | **2.4-3.2** | **22-31** | recommended; see MTP fix below |
+| No draft | n/a | n/a | ~10 | python MoE loop, or fused off |
+| MTP 3/1/4, accept 0 | 0.00 | 1.00 | ~5 | draft embeddings/fc not bound -- **slower than no-draft** |
+| MTP 3/1/4, no ReplaySSM | ~0.62 | ~2.9 | ~13 | fused MoE |
+| MTP 2/1/3 + ReplaySSM | ~0.75 | ~2.5 | ~13 | extra draft step did not pay |
+| **MTP 3/1/4 + ReplaySSM + fused exl3_moe** | **~0.69** | **~3.1** | **~35 wall / ~36 gen (`n=256`)** | **recommended** |
 
-Decode tok/s measured with `--disable-cuda-graph` (see CUDA graph
-limitation below); numbers would likely improve further with graphs
-enabled once that blocker is resolved.
+Older 2026-09-10 row (~17 no-draft / 22-31 MTP) was the same 3/1/4 flags
+before this pin's 35-arg `exl3_moe` and the embed-share overlay; treat the
+2026-09-16 table as the one to reproduce.
+
+## Pin overlays (required for the 35 tok/s path)
+
+SGLang `4ccff141d` still has `nn.Linear` for `mtp.fc_embedding`/`fc_hidden`
+and `eagle_worker_v2.init_lm_head` reading `.weight`. Apply once per pin:
+
+```bash
+SGLANG_PIN=/path/to/sglang/python bash scripts/apply_sglang_pin_overlays.sh
+```
+
+That copies `patches/qwen4_exp_mtp.py` (`ReplicatedLinear` + quant_config
+prefix) and patches `init_lm_head` to (1) assign
+`draft.model.embed_tokens.weight = target.model.embed_tokens.weight` and
+(2) `set_lm_head_from_target` when the head has no `.weight`. Skipping (1)
+leaves accept rate at 0.
 
 ## MTP fix: draft must load native EXL3, not dense weights
 
@@ -145,10 +177,11 @@ switched from plain `nn.Linear` to `ReplicatedLinear(quant_config=...)`
 with `prefix="mtp.fc_embedding"` / `"mtp.fc_hidden"` so those two layers'
 EXL3 packs actually match a `params_dict` key.
 
-After the fix, all draft packs load (verified via a post-load pack-fill
-check: `fc_embedding`, `fc_hidden`, `qkv_proj`, `o_proj`, shared-expert
-gate/down, indexer all report `filled=1` or higher), and accept rate jumps
-from 0.00 to 0.47-0.72.
+**Also required (PR #3):** never EXL3-quantize `embed_tokens` /
+`VocabParallelEmbedding`; share the target embedding tensor into the
+draft; share the EXL3 `lm_head` module (no `.weight`). Call `exl3_moe`
+with the 35-arg ABI. `EXL3_FUSED_MOE=0` or a 29-arg call drops to the
+python expert loop and caps decode around 10–16 tok/s even with MTP.
 
 ## Known limitation: `speculative_eagle_topk` is hard-capped at 1
 
@@ -243,7 +276,8 @@ mechanism (trellis dequant bound, not bandwidth bound) should transfer).
 
 | Symptom | Cause / fix |
 |---|---|
-| MTP accept rate stuck at 0.00, tok/s worse than no-draft | `sglang-exl3` predates the native-EXL3-draft fix (PR #2) -- update to `master` |
+| MTP accept rate stuck at 0.00, tok/s worse than no-draft | `sglang-exl3` missing PR #2/#3, pin overlays not applied, or `embed_tokens` still EXL3 -- update plugin, run `apply_sglang_pin_overlays.sh` |
+| `exl3_moe signature mismatch` / decode stuck ~10–16 tok/s with MTP accepting | 29-arg call vs 35-arg ext, or `EXL3_FUSED_MOE=0` -- need plugin `b1d9eab+` and `EXL3_FUSED_MOE=1` |
 | `Parameter fc_embedding.trellis not found in params_dict, skip loading` (repeated for `qkv_proj`, `o_proj`, shared-expert, indexer) | same as above -- draft is loading dense weights, not EXL3 |
 | `NotImplementedError: Qwen4-Exp QSA MTP currently supports speculative_eagle_topk=1` | you set `--speculative-eagle-topk` above 1 -- not supported, revert to 1 |
 | `CUDA error: device-side assert triggered` / `vectorized_gather_kernel: index out of bounds` right after relaunch with a non-default `speculative_num_steps`/`speculative_num_draft_tokens` | you raised those above the verified `steps=3 draft_tokens=4` pair -- revert |
